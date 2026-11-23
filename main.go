@@ -40,7 +40,7 @@ var (
 	ModalTokenRegex    = regexp.MustCompile(`\b(ak-[a-zA-Z0-9]{20,32}|as-[a-zA-Z0-9]{20,32})\b`)
 	ClaudeKeyRegex     = regexp.MustCompile(`\bsk-ant-api03-[A-Za-z0-9_-]{80,120}\b`)
 	GeminiKeyRegex     = regexp.MustCompile(`\b(AQ\.[A-Za-z0-9_-]{40,65}|AIzaSy[A-Za-z0-9_-]{33})\b`)
-	GitHubTokenRegex   = regexp.MustCompile(`\b(ghp_[a-zA-Z0-9]{36,}|github_pat_[a-zA-Z0-9_]{70,110}|gho_[a-zA-Z0-9]{36,})\b`)
+	GitHubTokenRegex   = regexp.MustCompile(`\b(ghp_|github_pat_|gho_|ghu_)[A-Za-z0-9_]{20,120}\b`)
 	Base64Candidate    = regexp.MustCompile(`\b[A-Za-z0-9+/]{60,}={0,2}\b`)
 )
 
@@ -346,8 +346,47 @@ func (tb *TelegramBot) StartPolling(ctx context.Context) {
 
 func (tb *TelegramBot) handleUserMessage(msg string) {
 	trimmed := strings.TrimSpace(msg)
+	if trimmed == "" {
+		return
+	}
 
-	// Check if message contains raw GitHub tokens
+	parts := strings.Fields(trimmed)
+	cmd := ""
+	if len(parts) > 0 {
+		cmd = strings.ToLower(parts[0])
+	}
+
+	// 1. Dedicated /add checkpoint command
+	if cmd == "/add" {
+		rawTokens := parts[1:]
+		var candidateTokens []string
+
+		// Check if any matched the updated GitHub token regex first
+		matched := GitHubTokenRegex.FindAllString(trimmed, -1)
+		if len(matched) > 0 {
+			candidateTokens = append(candidateTokens, matched...)
+		}
+
+		// Also extract any whitespace/newline separated tokens following /add
+		for _, token := range rawTokens {
+			t := strings.TrimSpace(token)
+			if t != "" {
+				candidateTokens = append(candidateTokens, t)
+			}
+		}
+
+		if len(candidateTokens) == 0 {
+			tb.SendMessage("⚠️ <b>Usage:</b> <code>/add &lt;token1&gt; &lt;token2&gt; ...</code> (or multiline tokens)")
+			return
+		}
+
+		added := tb.tp.AddTokens(candidateTokens)
+		tb.SendMessage(fmt.Sprintf("⚡ <b>[Tokens Loaded via /add]</b>\nAdded <b>%d</b> token(s). Active Pool: <b>%d</b>.", added, tb.tp.ActiveCount()))
+		fmt.Printf("[+] Masked Tokens Notification: %d token(s) added via /add into volatile RAM.\n", added)
+		return
+	}
+
+	// 2. Loose token ingestion if user pastes tokens without /add prefix
 	foundTokens := GitHubTokenRegex.FindAllString(trimmed, -1)
 	if len(foundTokens) > 0 {
 		added := tb.tp.AddTokens(foundTokens)
@@ -356,16 +395,11 @@ func (tb *TelegramBot) handleUserMessage(msg string) {
 		return
 	}
 
-	parts := strings.Fields(trimmed)
-	if len(parts) == 0 {
-		return
-	}
-	cmd := strings.ToLower(parts[0])
-
 	switch cmd {
 	case "/start", "/help":
 		helpText := `🤖 <b>Master Cloud Harvester Commands</b>
 
+/add <tokens...> - Bulk load GitHub tokens into RAM
 /status - Health, Uptime, Queue & Token count
 /stats - Total scans & verified discoveries
 /vault - Breakdown of active secrets
@@ -373,7 +407,7 @@ func (tb *TelegramBot) handleUserMessage(msg string) {
 /resume - Resume crawler workers
 /purge_tokens - Wipe volatile RAM GitHub tokens
 
-<i>Tip: Paste GitHub tokens directly to hot-reload them into memory!</i>`
+<i>Tip: Paste GitHub tokens directly or use /add to hot-reload them into memory!</i>`
 		tb.SendMessage(helpText)
 
 	case "/status":
