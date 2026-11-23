@@ -462,6 +462,192 @@ Commits Analyzed: %d
 	}
 }
 
+func maskToken(tok string) string {
+	tok = strings.TrimSpace(tok)
+	if len(tok) <= 8 {
+		return "****"
+	}
+	return tok[:4] + "..." + tok[len(tok)-4:]
+}
+
+func extractCandidateTokens(text string) []string {
+	var candidateTokens []string
+	seen := make(map[string]bool)
+
+	// 1. Check Regex matches
+	for _, m := range GitHubTokenRegex.FindAllString(text, -1) {
+		m = strings.TrimSpace(m)
+		if m != "" && !seen[m] {
+			candidateTokens = append(candidateTokens, m)
+			seen[m] = true
+		}
+	}
+
+	// 2. Also check whitespace/newline tokens
+	for _, token := range strings.Fields(text) {
+		t := strings.Trim(token, `"',;()[]{}`)
+		t = strings.TrimSpace(t)
+		if t != "" && strings.ToLower(t) != "/add" && !seen[t] {
+			candidateTokens = append(candidateTokens, t)
+			seen[t] = true
+		}
+	}
+	return candidateTokens
+}
+
+// ============================================================================
+// HTTP SERVER (CURL / WEBHOOK ACCESS & HEALTH CHECKS)
+// ============================================================================
+func StartHTTPServer(port string, tp *TokenPool, ds *DeduplicationStore) *http.Server {
+	if port == "" {
+		port = "8080"
+	}
+
+	mux := http.NewServeMux()
+
+	// GET / or /health or /status
+	statusHandler := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]interface{}{
+			"status":            "healthy",
+			"service":           "master-cloud-harvester",
+			"uptime":            time.Since(GlobalStats.StartTime).Round(time.Second).String(),
+			"scanning_state":    getScanningState(),
+			"active_ram_tokens": tp.ActiveCount(),
+			"parallel_workers":  WorkerCount,
+			"files_scanned":     atomic.LoadUint64(&GlobalStats.FilesScanned),
+			"commits_diffed":    atomic.LoadUint64(&GlobalStats.CommitsDiffed),
+			"cached_repos":      len(ds.reposCache),
+			"cached_urls":       len(ds.urlsCache),
+			"discoveries": map[string]uint64{
+				"openai":     atomic.LoadUint64(&GlobalStats.OpenAIHits),
+				"claude":     atomic.LoadUint64(&GlobalStats.ClaudeHits),
+				"gemini":     atomic.LoadUint64(&GlobalStats.GeminiHits),
+				"openrouter": atomic.LoadUint64(&GlobalStats.OpenRouterHits),
+				"render":     atomic.LoadUint64(&GlobalStats.RenderHits),
+				"modal":      atomic.LoadUint64(&GlobalStats.ModalHits),
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+
+	mux.HandleFunc("/", statusHandler)
+	mux.HandleFunc("/status", statusHandler)
+	mux.HandleFunc("/health", statusHandler)
+
+	// POST /add - accepts JSON {"tokens": ["..."]} or raw body lines / curl -d
+	mux.HandleFunc("/add", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"Method not allowed. Use POST"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Optional auth check: if HARVESTER_AUTH_TOKEN is configured in env, require it
+		expectedAuth := os.Getenv("HARVESTER_AUTH_TOKEN")
+		if expectedAuth != "" {
+			clientAuth := r.Header.Get("X-Harvester-Token")
+			if clientAuth == "" {
+				authHeader := r.Header.Get("Authorization")
+				if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+					clientAuth = strings.TrimSpace(authHeader[7:])
+				}
+			}
+			if clientAuth != expectedAuth {
+				http.Error(w, `{"error":"Unauthorized"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, `{"error":"Failed to read request body"}`, http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+
+		rawStr := string(bodyBytes)
+		var candidateTokens []string
+
+		// Check if payload is JSON
+		var jsonPayload struct {
+			Tokens []string `json:"tokens"`
+			Token  string   `json:"token"`
+		}
+		if err := json.Unmarshal(bodyBytes, &jsonPayload); err == nil {
+			if jsonPayload.Token != "" {
+				candidateTokens = append(candidateTokens, jsonPayload.Token)
+			}
+			for _, t := range jsonPayload.Tokens {
+				t = strings.TrimSpace(t)
+				if t != "" {
+					candidateTokens = append(candidateTokens, t)
+				}
+			}
+		}
+
+		// If no JSON tokens found, parse text/raw body lines
+		if len(candidateTokens) == 0 {
+			candidateTokens = extractCandidateTokens(rawStr)
+		}
+
+		if len(candidateTokens) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   "No tokens found in request body. Send raw tokens or JSON {'tokens':['ghp_...']}",
+			})
+			return
+		}
+
+		added := tp.AddTokens(candidateTokens)
+
+		// Masked token samples for secure logging and response
+		var maskedSample []string
+		for i, tok := range candidateTokens {
+			if i >= 5 {
+				maskedSample = append(maskedSample, fmt.Sprintf("...and %d more", len(candidateTokens)-5))
+				break
+			}
+			maskedSample = append(maskedSample, maskToken(tok))
+		}
+
+		fmt.Printf("[+] [HTTP /add] Ingested %d candidate(s), added %d new token(s) to RAM. Active: %d (Sample: %v)\n",
+			len(candidateTokens), added, tp.ActiveCount(), maskedSample)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":        true,
+			"added":          added,
+			"active_pool":    tp.ActiveCount(),
+			"candidates":     len(candidateTokens),
+			"sample_masked":  maskedSample,
+		})
+	})
+
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+	}
+
+	go func() {
+		fmt.Printf("[⚡ HTTP Server] Listening on port :%s for curl & web requests (/add, /status, /health)\n", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("[!] HTTP Server error: %v\n", err)
+		}
+	}()
+
+	return srv
+}
+
 func getScanningState() string {
 	if GlobalPaused.Load() {
 		return "PAUSED"
@@ -767,6 +953,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var (
+		httpServer   *http.Server
+		httpServerMu sync.Mutex
+	)
+
 	// Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -775,11 +966,29 @@ func main() {
 		fmt.Println("\n[!] Gracefully shutting down Harvester...")
 		telegramBot.SendMessage("🛑 <b>Master Cloud Harvester Stopped.</b>")
 		cancel()
+		httpServerMu.Lock()
+		srv := httpServer
+		httpServerMu.Unlock()
+		if srv != nil {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer shutdownCancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}
 		os.Exit(0)
 	}()
 
 	// Start Telegram 2-way polling
 	go telegramBot.StartPolling(ctx)
+
+	// Start HTTP Server on PORT (Render default or 8080) for curl / webhook access
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	serverInstance := StartHTTPServer(port, tokenPool, dedup)
+	httpServerMu.Lock()
+	httpServer = serverInstance
+	httpServerMu.Unlock()
 
 	// Send startup notification
 	telegramBot.SendMessage(`🚀 <b>Master Cloud Harvester Online (Golang Engine)</b>
