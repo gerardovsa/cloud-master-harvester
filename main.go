@@ -40,7 +40,7 @@ var (
 	ModalTokenRegex    = regexp.MustCompile(`\b(ak-[a-zA-Z0-9]{20,32}|as-[a-zA-Z0-9]{20,32})\b`)
 	ClaudeKeyRegex     = regexp.MustCompile(`\bsk-ant-api03-[A-Za-z0-9_-]{80,120}\b`)
 	GeminiKeyRegex     = regexp.MustCompile(`\b(AQ\.[A-Za-z0-9_-]{40,65}|AIzaSy[A-Za-z0-9_-]{33})\b`)
-	GitHubTokenRegex   = regexp.MustCompile(`\b(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{60,110}|gho_[a-zA-Z0-9]{30,50})\b`)
+	GitHubTokenRegex   = regexp.MustCompile(`\b(ghp_[a-zA-Z0-9]{36,}|github_pat_[a-zA-Z0-9_]{70,110}|gho_[a-zA-Z0-9]{36,})\b`)
 	Base64Candidate    = regexp.MustCompile(`\b[A-Za-z0-9+/]{60,}={0,2}\b`)
 )
 
