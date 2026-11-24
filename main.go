@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1182,7 +1183,7 @@ Target Verification:
 				}
 
 				token := tokenPool.GetRandomToken()
-				url := fmt.Sprintf("https://api.github.com/search/code?q=%s&per_page=100&sort=indexed", dork)
+				url := fmt.Sprintf("https://api.github.com/search/code?q=%s&per_page=100&sort=indexed", url.QueryEscape(dork))
 				req, _ := http.NewRequest("GET", url, nil)
 				if token != "" {
 					req.Header.Set("Authorization", "token "+token)
