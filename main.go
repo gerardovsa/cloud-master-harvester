@@ -1,4 +1,4 @@
-package main
+check againpackage main
 
 import (
 	"bytes"
@@ -540,6 +540,34 @@ func StartHTTPServer(port string, tp *TokenPool, ds *DeduplicationStore) *http.S
 	mux.HandleFunc("/", statusHandler)
 	mux.HandleFunc("/status", statusHandler)
 	mux.HandleFunc("/health", statusHandler)
+
+	// GET /dumps - list and load all loot dump files
+	mux.HandleFunc("/dumps", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		entries, err := os.ReadDir(LootDir)
+		if err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"dumps": []interface{}{}, "count": 0, "error": err.Error()})
+			return
+		}
+
+		var dumps []interface{}
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+				fPath := filepath.Join(LootDir, e.Name())
+				data, err := os.ReadFile(fPath)
+				if err == nil {
+					var obj interface{}
+					if json.Unmarshal(data, &obj) == nil {
+						dumps = append(dumps, obj)
+					}
+				}
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"count": len(dumps),
+			"dumps": dumps,
+		})
+	})
 
 	// POST /add - accepts JSON {"tokens": ["..."]} or raw body lines / curl -d
 	mux.HandleFunc("/add", func(w http.ResponseWriter, r *http.Request) {
